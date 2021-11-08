@@ -11,6 +11,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
+// TODO: update/create tests for new `AccessReview(` function
 func TestAuthorizer_CanI(t *testing.T) {
 	kubeClient := &kubefake.Clientset{}
 	allowed := true
@@ -21,10 +22,8 @@ func TestAuthorizer_CanI(t *testing.T) {
 	})
 	ctx := context.WithValue(context.Background(), KubeKey, kubeClient)
 	t.Run("CanI", func(t *testing.T) {
-		allowed, err := CanI(ctx, "", "", "", "")
-		if assert.NoError(t, err) {
-			assert.True(t, allowed)
-		}
+		err := AccessReview(ctx, "", "", "", "", "", true)
+		assert.NoError(t, err)
 	})
 	kubeClient.AddReactor("create", "selfsubjectrulesreviews", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 		return true, &authorizationv1.SelfSubjectRulesReview{

@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	workflow "github.com/argoproj/argo-workflows/v3/pkg/client/clientset/versioned"
+	"github.com/argoproj/argo-workflows/v3/server/auth/impersonate"
 	"github.com/argoproj/argo-workflows/v3/server/auth/serviceaccount"
 	"github.com/argoproj/argo-workflows/v3/server/auth/sso"
 	"github.com/argoproj/argo-workflows/v3/server/auth/types"
@@ -41,6 +42,7 @@ const (
 	EventSourceKey ContextKey = "eventsource.Interface"
 	KubeKey        ContextKey = "kubernetes.Interface"
 	ClaimsKey      ContextKey = "types.Claims"
+	ImpersonateKey ContextKey = "impersonate.Config"
 )
 
 //go:generate mockery --name=Gatekeeper
@@ -104,6 +106,18 @@ func (s *gatekeeper) Context(ctx context.Context) (context.Context, error) {
 	ctx = context.WithValue(ctx, SensorKey, clients.Sensor)
 	ctx = context.WithValue(ctx, KubeKey, clients.Kubernetes)
 	ctx = context.WithValue(ctx, ClaimsKey, claims)
+
+	if s.ssoIf.ImpersonateConfig().IsEnabled() {
+		//
+		// TODO: set username in this client (rather than providing with each AccessReview)
+		//
+		impersonate, err := impersonate.NewClient(s.clients.Kubernetes)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, ImpersonateKey, impersonate)
+	}
+
 	return ctx, nil
 }
 
@@ -130,6 +144,10 @@ func GetKubeClient(ctx context.Context) kubernetes.Interface {
 func GetClaims(ctx context.Context) *types.Claims {
 	config, _ := ctx.Value(ClaimsKey).(*types.Claims)
 	return config
+}
+
+func GetImpersonateClient(ctx context.Context) impersonate.Client {
+	return ctx.Value(ImpersonateKey).(impersonate.Client)
 }
 
 func getAuthHeader(md metadata.MD) string {
@@ -173,6 +191,9 @@ func (s gatekeeper) getClients(ctx context.Context) (*servertypes.Clients, *type
 		if err != nil {
 			return nil, nil, status.Error(codes.Unauthenticated, err.Error())
 		}
+		if s.ssoIf.IsRBACEnabled() && s.ssoIf.ImpersonateConfig().IsEnabled() {
+			return nil, nil, status.Error(codes.InvalidArgument, "only one of `sso.rbac.enabled` or `sso.impersonate.enabled` can be true")
+		}
 		if s.ssoIf.IsRBACEnabled() {
 			clients, err := s.rbacAuthorization(ctx, claims)
 			if err != nil {
@@ -180,14 +201,62 @@ func (s gatekeeper) getClients(ctx context.Context) (*servertypes.Clients, *type
 				return nil, nil, status.Error(codes.PermissionDenied, "not allowed")
 			}
 			return clients, claims, nil
-		} else {
-			// important! write an audit entry (i.e. log entry) so we know which user performed an operation
-			log.WithFields(addClaimsLogFields(claims, nil)).Info("using the default service account for user")
-			return s.clients, claims, nil
 		}
+		if s.ssoIf.ImpersonateConfig().IsEnabled() {
+			clients, err := s.impersonateAuthorization(claims)
+			if err != nil {
+				log.WithError(err).Error("failed to setup Impersonation authorization")
+				return nil, nil, status.Error(codes.PermissionDenied, "not allowed")
+			}
+			return clients, claims, nil
+		}
+		// important! write an audit entry (i.e. log entry) so we know which user performed an operation
+		log.WithFields(addClaimsLogFields(claims, nil)).Info("using the default service account for user")
+		return s.clients, claims, nil
 	default:
 		panic("this should never happen")
 	}
+}
+
+func (s *gatekeeper) impersonateAuthorization(claims *types.Claims) (*servertypes.Clients, error) {
+	restConfig := s.restConfig
+	restConfig.Wrap(
+		func(rt http.RoundTripper) http.RoundTripper {
+			//
+			// TODO: set username in impersonateClient
+			//
+			return NewImpersonateRoundTripper(rt, claims.Email)
+		},
+	)
+
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failure to create dynamic client: %w", err)
+	}
+	wfClient, err := workflow.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failure to create workflow client: %w", err)
+	}
+	eventSourceClient, err := eventsource.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failure to create event source client: %w", err)
+	}
+	sensorClient, err := sensor.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failure to create sensor client: %w", err)
+	}
+	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failure to create kubernetes client: %w", err)
+	}
+
+	return &servertypes.Clients{
+		Dynamic:     dynamicClient,
+		Workflow:    wfClient,
+		Sensor:      sensorClient,
+		EventSource: eventSourceClient,
+		Kubernetes:  kubeClient,
+	}, nil
 }
 
 func (s *gatekeeper) rbacAuthorization(ctx context.Context, claims *types.Claims) (*servertypes.Clients, error) {

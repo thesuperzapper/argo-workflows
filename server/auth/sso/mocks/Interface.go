@@ -48,6 +48,7 @@ func (_m *Interface) HandleRedirect(writer http.ResponseWriter, request *http.Re
 	_m.Called(writer, request)
 }
 
+// TODO: add tests for `IsImpersonateEnabled(`
 // IsRBACEnabled provides a mock function with given fields:
 func (_m *Interface) IsRBACEnabled() bool {
 	ret := _m.Called()

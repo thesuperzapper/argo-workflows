@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/argoproj/argo-workflows/v3/server/auth/impersonate"
 	"github.com/argoproj/argo-workflows/v3/server/auth/rbac"
 	"github.com/argoproj/argo-workflows/v3/server/auth/types"
 )
@@ -41,27 +42,33 @@ type Interface interface {
 	HandleRedirect(writer http.ResponseWriter, request *http.Request)
 	HandleCallback(writer http.ResponseWriter, request *http.Request)
 	IsRBACEnabled() bool
+	ImpersonateConfig() *impersonate.Config
 }
 
 var _ Interface = &sso{}
 
 type sso struct {
-	config          *oauth2.Config
-	issuer          string
-	idTokenVerifier *oidc.IDTokenVerifier
-	httpClient      *http.Client
-	baseHRef        string
-	secure          bool
-	privateKey      crypto.PrivateKey
-	encrypter       jose.Encrypter
-	rbacConfig      *rbac.Config
-	expiry          time.Duration
-	customClaimName string
-	userInfoPath    string
+	config            *oauth2.Config
+	issuer            string
+	idTokenVerifier   *oidc.IDTokenVerifier
+	httpClient        *http.Client
+	baseHRef          string
+	secure            bool
+	privateKey        crypto.PrivateKey
+	encrypter         jose.Encrypter
+	rbacConfig        *rbac.Config
+	impersonateConfig *impersonate.Config
+	expiry            time.Duration
+	customClaimName   string
+	userInfoPath      string
 }
 
 func (s *sso) IsRBACEnabled() bool {
 	return s.rbacConfig.IsEnabled()
+}
+
+func (s *sso) ImpersonateConfig() *impersonate.Config {
+	return s.impersonateConfig
 }
 
 type Config struct {
@@ -71,6 +78,7 @@ type Config struct {
 	ClientSecret apiv1.SecretKeySelector `json:"clientSecret"`
 	RedirectURL  string                  `json:"redirectUrl"`
 	RBAC         *rbac.Config            `json:"rbac,omitempty"`
+	Impersonate  *impersonate.Config     `json:"impersonate,omitempty"`
 	// additional scopes (on top of "openid")
 	Scopes        []string        `json:"scopes,omitempty"`
 	SessionExpiry metav1.Duration `json:"sessionExpiry,omitempty"`
@@ -121,6 +129,9 @@ func newSso(
 	}
 	if c.ClientSecret.Name == "" || c.ClientSecret.Key == "" {
 		return nil, fmt.Errorf("clientSecret empty")
+	}
+	if c.RBAC.IsEnabled() && c.Impersonate.IsEnabled() {
+		return nil, fmt.Errorf("only one of `rbac.enabled` or `impersonate.enabled` can be true")
 	}
 	ctx := context.Background()
 	clientSecretObj, err := secretsIf.Get(ctx, c.ClientSecret.Name, metav1.GetOptions{})
@@ -200,18 +211,19 @@ func newSso(
 	log.WithFields(lf).Info("SSO configuration")
 
 	return &sso{
-		config:          config,
-		idTokenVerifier: idTokenVerifier,
-		baseHRef:        baseHRef,
-		httpClient:      httpClient,
-		secure:          secure,
-		privateKey:      privateKey,
-		encrypter:       encrypter,
-		rbacConfig:      c.RBAC,
-		expiry:          c.GetSessionExpiry(),
-		customClaimName: c.CustomGroupClaimName,
-		userInfoPath:    c.UserInfoPath,
-		issuer:          c.Issuer,
+		config:            config,
+		idTokenVerifier:   idTokenVerifier,
+		baseHRef:          baseHRef,
+		httpClient:        httpClient,
+		secure:            secure,
+		privateKey:        privateKey,
+		encrypter:         encrypter,
+		rbacConfig:        c.RBAC,
+		impersonateConfig: c.Impersonate,
+		expiry:            c.GetSessionExpiry(),
+		customClaimName:   c.CustomGroupClaimName,
+		userInfoPath:      c.UserInfoPath,
+		issuer:            c.Issuer,
 	}, nil
 }
 
